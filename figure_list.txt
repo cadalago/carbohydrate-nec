@@ -1,0 +1,19 @@
+main figures:
+1	created in powerpoint
+2	cho_sum_stats.R
+3	16S_bacterial_load.R
+4	CHO_NEC_microbiome.R
+5	created in excel/powerpoint
+6	created using sage.mx
+7	metabolites.R
+8	metabolites.R
+
+additional figures:
+1	cho_sum_stats.R
+2	created using sage.mx
+3	CHO_NEC_microbiome.R
+4	created w MetaboAnalyst
+5	metabolites.R
+
+
+Sequence files and metadata for samples used in this study have been deposited in NCBI SRA and are available at accession numbers ########-#########.  All data files along with the R scripts used to generate the main figures for this paper are made available at https://github.com/ltcall/carbohydrate-nec.
