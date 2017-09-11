@@ -1,0 +1,991 @@
+---
+title: "Metabolomic Signatures Distinguish the Impact of Dietary Carbohydrates on Disease Outcome in a Preterm Piglet Model of NEC"
+output: html_notebook
+---
+
+This document is a record of all analysis steps required to reproduce the work reported in the manuscript.  Although some formatting differences may exist from the final published figures, the main results and conclusions are equivalent.  Data files used for this analysis should be placed in the same folder as this .Rmd file.
+
+```{r global_options}
+knitr::opts_chunk$set(warning=FALSE, message=FALSE)
+```
+
+```{r results='hide'}
+
+library(multcomp)
+library(ggplot2)
+library(reshape2)
+library(scales)
+library(phyloseq)
+library(gridExtra)
+library(RColorBrewer)
+library(pheatmap)  
+
+colors=c('#4daf4a', '#377eb8', '#e41a1c')
+group_colors=c('#000000', '#4daf4a', '#377eb8', '#e41a1c')
+diet_colors <- c('#4daf4a', '#377eb8', '#e41a1c')
+hn_colors <- c('turquoise3', 'orangered1')
+group_NEC_colors <- c('#000000', '#4daf4a', '#316f2f', '#377eb8', '#1e4666', '#e41a1c', '#b01414')  
+
+morph.written = FALSE  
+
+# utility functions to be used in analysis of piglet NEC carbohydrate study
+getMJNPigs <- function(incl.new = TRUE) {
+		# read in data
+		pigs <- read.csv('pigs_anthropometrics_morphometry_severity.csv', strip.white=T)
+		
+		# parse 'pigID' into separate columns for litter, letter
+		pigs <- cbind(factor(unlist(lapply(pigs[, 'pigID'], function(x){substr(x, 4, 4)}))), pigs)
+		pigs <- cbind(factor(unlist(lapply(pigs[, 'pigID'], function(x){as.numeric(substr(x, 1, 3))}))), pigs)
+		names(pigs)[1:2] <- c('litter', 'letter')
+		
+		# add in calculated columns to pigs
+		pigs$clin.tot <- pigs$clin.st + pigs$clin.je + pigs$clin.il + pigs$clin.co
+		pigs$hist.tot <- pigs$hist.pj + pigs$hist.di + pigs$hist.co
+		pigs$clin.max <- apply(pigs[, c('clin.st', 'clin.je', 'clin.il', 'clin.co')], 1, 
+		                       function(x){suppressWarnings(max(x, na.rm=T))})
+		pigs$hist.max <- apply(pigs[, c('hist.pj', 'hist.di', 'hist.co')], 1,
+		                       function(x){suppressWarnings(max(x, na.rm=T))})
+		pigs$clin.nec <- pigs$clin.max > 2
+		pigs$clin.nec <- factor(pigs$clin.nec, labels=c('Healthy', 'NEC'))
+		pigs$hist.nec <- pigs$hist.max > 1
+		pigs$hist.nec <- factor(pigs$hist.nec, labels=c('Healthy', 'NEC'))
+		
+		pigs$dob <- as.Date(as.character(pigs$dob), '%Y%m%d')
+		pigs$dod <- as.Date(as.character(pigs$dod), '%Y%m%d')
+		
+		# convert time of death (tod) to hours in decimal form
+		pigs$tod.d <- sapply(strsplit(as.character(pigs[, 'tod']), ':'), function(x){
+		  x <- as.numeric(x)
+		  x[1]+x[2]/60
+		})
+		
+		# 24 hrs for each day of feeding (first 2 days of life are TPN only) plus the time of death 
+		#   on final day minus 12 hrs b/c feeding begins at 12:00
+		pigs$hrs.after.feed <- as.numeric((pigs$dod-pigs$dob-2)*24 + pigs$tod.d - 12) 
+		
+		# weight.gain expressed as:  g / (kg * day)  from birthweight to deathweight
+		pigs$weight.gain <- (pigs$weight.d - pigs$weight.b) / 
+		                      ((pigs$weight.b / 1000) * (pigs$hrs.after.feed / 24))
+		
+		# save new file w/ added columns (only first time this function is called)
+		if(!morph.written) {
+		  write.csv(pigs, 'pigs_anthropometrics_morphometry_severity_processed.csv', row.names = F)
+		  morph.written = TRUE
+		}
+		
+		# according to preference passed in function call, include or remove all newborn
+		if(incl.new) {
+		  # force use of this order L -> R
+			pigs$group <- factor(pigs$group, levels=c('NEW', 'LAC', 'MIX', 'CSS'), ordered=T)	
+		}
+		else {
+			pigs <- pigs[which(pigs[, 'group'] != 'NEW'), ]  
+			pigs$group <- droplevels(pigs$group)
+			# force use of this order L -> R
+			pigs$group <- factor(pigs$group, levels=c('LAC', 'MIX', 'CSS'), ordered=T)  
+		}
+		
+		# remove pigs from litters 228 (no amplification), 234 (early deaths), 
+		#   and 248-249 (fridge died - used different formula)
+		pigs <- pigs[!c(pigs$litter %in% c(228, 234, 248, 249)), ]
+		
+		# remove pigs found with perforated stomachs from orogastric tube
+		pigs <- pigs[!c(pigs$pigID %in% c('215E','215I','215L')), ]
+		
+		# remove pigs which received lactose or mix diet from litters 212, 213 
+		#   (bad batch of lactose/mix formulas)
+		pigs <- pigs[!c(pigs$litter %in% c(212, 213) & pigs$group %in% c('LAC', 'MIX')), ]
+		pigs$litter <- droplevels(pigs$litter)
+		
+		return(pigs)
+}
+
+se <- function(x) {
+    sd(x) / sqrt(length(x))
+}
+
+## Gives count, mean, standard deviation, standard error of the mean, and 
+##    confidence interval (default 95%).
+##   data: a data frame.
+##   measurevar: the name of a column that contains the variable to be summariezed
+##   groupvars: a vector containing names of columns that contain grouping variables
+##   na.rm: a boolean that indicates whether to ignore NA's
+##   conf.interval: the percent range of the confidence interval (default is 95%)
+#####  from http://www.cookbook-r.com/Graphs/Plotting_means_and_error_bars_(ggplot2)
+summarySE <- function(data=NULL, measurevar, groupvars=NULL, na.rm=FALSE,
+											conf.interval=.95, .drop=TRUE) {
+	library(plyr)
+	
+	# New version of length which can handle NA's: if na.rm==T, don't count them
+	length2 <- function (x, na.rm=FALSE) {
+		if (na.rm) sum(!is.na(x))
+		else       length(x)
+	}
+	
+	# This does the summary. For each group's data frame, return a vector with
+	# N, mean, and sd
+	datac <- ddply(data, groupvars, .drop=.drop,
+								 .fun = function(xx, col) {
+								 	c(N    = length2(xx[[col]], na.rm=na.rm),
+								 		mean = mean   (xx[[col]], na.rm=na.rm),
+								 		sd   = sd     (xx[[col]], na.rm=na.rm)
+								 	)
+								 },
+								 measurevar
+	)
+	
+	# Rename the "mean" column    
+	datac <- rename(datac, c("mean" = measurevar))
+	
+	datac$se <- datac$sd / sqrt(datac$N)  # Calculate standard error of the mean
+	
+	# Confidence interval multiplier for standard error
+	# Calculate t-statistic for confidence interval: 
+	# e.g., if conf.interval is .95, use .975 (above/below), and use df=N-1
+	ciMult <- qt(conf.interval/2 + .5, datac$N-1)
+	datac$ci <- datac$se * ciMult
+	
+	return(datac)
+}
+
+brightness <- function(rgbcol, v) {
+  conv <- as.list(as.data.frame(t(rgb2hsv(col2rgb(rgbcol)))))
+  conv[[3]] <- v
+  do.call(hsv, conv)
+}
+```
+
+## Table 2. Body weights and gut morphometry
+
+```{r}
+pigs <- getMJNPigs(incl.new = T)
+pigs[which(pigs[, 'group'] == 'NEW'), 'hist.nec'] <- 'Healthy'
+# descriptive summaries
+with(pigs, table(group, hist.nec))
+with(pigs, aggregate(weight.b ~ group + hist.nec, FUN=mean))
+with(pigs, aggregate(weight.b ~ group + hist.nec, FUN=se))
+with(pigs, aggregate(weight.d ~ group + hist.nec, FUN=mean))
+with(pigs, aggregate(weight.d ~ group + hist.nec, FUN=se))
+with(pigs, aggregate(weight.gain ~ group + hist.nec, FUN=mean))
+with(pigs, aggregate(weight.gain ~ group + hist.nec, FUN=se))
+with(pigs, aggregate(pj.vh ~ group + hist.nec, FUN=mean))
+with(pigs, aggregate(pj.vh ~ group + hist.nec, FUN=se))
+with(pigs, aggregate(pj.cd ~ group + hist.nec, FUN=mean))
+with(pigs, aggregate(pj.cd ~ group + hist.nec, FUN=se))
+with(pigs, aggregate(di.vh ~ group + hist.nec, FUN=mean))
+with(pigs, aggregate(di.vh ~ group + hist.nec, FUN=se))
+with(pigs, aggregate(di.cd ~ group + hist.nec, FUN=mean))
+with(pigs, aggregate(di.cd ~ group + hist.nec, FUN=se))
+with(pigs, aggregate(co.cd ~ group + hist.nec, FUN=mean))
+with(pigs, aggregate(co.cd ~ group + hist.nec, FUN=se))
+# test for differences between healthy groups
+pigs.h <- pigs[which(pigs[, 'hist.nec'] == 'Healthy'), ]
+summary(glht(glm(weight.b ~ group, family=gaussian, data=pigs.h), linfct = mcp(group='Tukey')))
+summary(glht(glm(weight.d ~ group, family=gaussian, data=pigs.h), linfct = mcp(group='Tukey')))
+summary(glht(glm(weight.gain ~ group, family=gaussian, data=pigs.h), linfct = mcp(group='Tukey')))
+summary(glht(glm(pj.vh ~ group, family=gaussian, data=pigs.h), linfct = mcp(group='Tukey')))
+summary(glht(glm(pj.cd ~ group, family=gaussian, data=pigs.h), linfct = mcp(group='Tukey')))
+summary(glht(glm(di.vh ~ group, family=gaussian, data=pigs.h), linfct = mcp(group='Tukey')))
+summary(glht(glm(di.cd ~ group, family=gaussian, data=pigs.h), linfct = mcp(group='Tukey')))
+summary(glht(glm(co.cd ~ group, family=gaussian, data=pigs.h), linfct = mcp(group='Tukey')))
+# test for differences between NEC groups
+pigs.n <- pigs[which(pigs[, 'hist.nec'] == 'NEC'), ]
+summary(glht(glm(weight.b ~ group, family=gaussian, data=pigs.n), linfct = mcp(group='Tukey')))
+summary(glht(glm(weight.d ~ group, family=gaussian, data=pigs.n), linfct = mcp(group='Tukey')))
+summary(glht(glm(weight.gain ~ group, family=gaussian, data=pigs.n), linfct = mcp(group='Tukey')))
+summary(glht(glm(pj.vh ~ group, family=gaussian, data=pigs.n), linfct = mcp(group='Tukey')))
+summary(glht(glm(pj.cd ~ group, family=gaussian, data=pigs.n), linfct = mcp(group='Tukey')))
+summary(glht(glm(di.vh ~ group, family=gaussian, data=pigs.n), linfct = mcp(group='Tukey')))
+summary(glht(glm(di.cd ~ group, family=gaussian, data=pigs.n), linfct = mcp(group='Tukey')))
+summary(glht(glm(co.cd ~ group, family=gaussian, data=pigs.n), linfct = mcp(group='Tukey')))
+# test for differences between healthy vs NEC within groups
+with(pigs[which(pigs$group == 'LAC'), ], t.test(weight.b ~ hist.nec))
+with(pigs[which(pigs$group == 'LAC'), ], t.test(weight.d ~ hist.nec))
+with(pigs[which(pigs$group == 'LAC'), ], t.test(weight.gain ~ hist.nec))
+with(pigs[which(pigs$group == 'LAC'), ], t.test(pj.vh ~ hist.nec))
+with(pigs[which(pigs$group == 'LAC'), ], t.test(pj.cd ~ hist.nec))
+with(pigs[which(pigs$group == 'LAC'), ], t.test(di.vh ~ hist.nec))
+with(pigs[which(pigs$group == 'LAC'), ], t.test(di.cd ~ hist.nec))
+with(pigs[which(pigs$group == 'LAC'), ], t.test(co.cd ~ hist.nec))
+with(pigs[which(pigs$group == 'MIX'), ], t.test(weight.b ~ hist.nec))
+with(pigs[which(pigs$group == 'MIX'), ], t.test(weight.d ~ hist.nec))
+with(pigs[which(pigs$group == 'MIX'), ], t.test(weight.gain ~ hist.nec))
+with(pigs[which(pigs$group == 'MIX'), ], t.test(pj.vh ~ hist.nec))
+with(pigs[which(pigs$group == 'MIX'), ], t.test(pj.cd ~ hist.nec))
+with(pigs[which(pigs$group == 'MIX'), ], t.test(di.vh ~ hist.nec))
+with(pigs[which(pigs$group == 'MIX'), ], t.test(di.cd ~ hist.nec))
+with(pigs[which(pigs$group == 'MIX'), ], t.test(co.cd ~ hist.nec))
+with(pigs[which(pigs$group == 'CSS'), ], t.test(weight.b ~ hist.nec))
+with(pigs[which(pigs$group == 'CSS'), ], t.test(weight.d ~ hist.nec))
+with(pigs[which(pigs$group == 'CSS'), ], t.test(weight.gain ~ hist.nec))
+with(pigs[which(pigs$group == 'CSS'), ], t.test(pj.vh ~ hist.nec))
+with(pigs[which(pigs$group == 'CSS'), ], t.test(pj.cd ~ hist.nec))
+with(pigs[which(pigs$group == 'CSS'), ], t.test(di.vh ~ hist.nec))
+with(pigs[which(pigs$group == 'CSS'), ], t.test(di.cd ~ hist.nec))
+with(pigs[which(pigs$group == 'CSS'), ], t.test(co.cd ~ hist.nec))
+rm(pigs.h, pigs.n)
+```
+
+## Figure 2. Phenotypic outcomes
+
+```{r}
+pigs <- getMJNPigs(incl.new = F)
+
+# incidence plot
+t<-with(pigs,table(group, hist.nec))
+pigs$hist.nec.logical <- pigs$hist.nec == 'NEC'
+clin_nec_incidence_summary <- summarySE(pigs, measurevar = 'hist.nec.logical', groupvars = 'group')
+ggplot(clin_nec_incidence_summary, aes(x = group, y = hist.nec.logical, fill = group)) + 
+  scale_fill_manual(values = colors) + geom_bar(stat = 'identity', width = 0.8) +
+  annotate('text', x = 1:3, y = 0.05, label = paste(t[,2], clin_nec_incidence_summary$N, sep = '/'),
+           fontface = 'bold', color = 'white', cex = 6) +
+  labs(list(title = 'NEC Incidence', x = '', y = '')) + scale_y_continuous(element_blank()) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = 'black'), axis.title.x = element_text(vjust = -0.5),
+        axis.title.y = element_text(vjust = 1.5), text = element_text(face = 'bold', size = 18),
+        axis.text = element_text(color = 'black'), legend.title = element_blank(),
+        legend.position = 'none')
+rm(t, clin_nec_incidence_summary)
+
+# incidence stats
+addmargins(table(pigs$group, pigs$hist.nec, useNA='ifany'))
+fisher.test(pigs$group, pigs$hist.nec)
+
+# survival curve plot
+# count any NEC pig sacrificed before 9am (beginning of collection day)
+#   (aka 117 = 3 hrs less than 120) as an event
+surv_model <- with(pigs, Surv(hrs.after.feed, as.numeric(hrs.after.feed < 119 & hist.nec == 'NEC')))
+
+sf  <-  survfit(surv_model ~ group, conf.type="log", 
+              conf.int=0.95, type="kaplan-meier", error="greenwood", data=pigs)
+
+op <- par(font=2, cex.axis=1.5, cex.lab=1.8, mar = c(5, 7, 4, 2) + 0.1)
+plot(sf, lty=1, lwd=4, font=2, font.lab=2, mark.time=TRUE, xlab='Hours of enteral feeding',
+     frame.plot=F, xaxt='n', yaxt='n', col=colors)
+  rect(0, 0, 124, 1, col = 'white', lty=0)
+  axis(1, lwd=2, font=2, font.lab=2, at=c(0, 140), lwd.ticks=0, pos=c(0, 0))
+  axis(1, at=seq(0, 130, by=24), lwd=0, lwd.ticks=1, font=2, pos=c(0, 0))
+  axis(2, lwd=2, las=2, font=2, font.lab=2, at=seq(0, 1, 0.2), labels=paste(seq(0, 100, 20), "%", sep=""))
+  lines(sf, lty=1, lwd=4, mark.time=F, col=colors)
+  title(ylab='Non-NEC Survival', font.lab=2, cex.lab=1.8, line=4.5)
+  legend(text.width=14, x=22, y=0.35, legend=c('LAC', 'MIX', 'CSS'), col=colors, lty=1, lwd=4,
+         bty="y", bg='white')
+par(op)
+# survival curve stats (Log-rank test)
+survdiff(surv_model~group, data=pigs, rho=0)  ## overall
+survdiff(surv_model~group, data=pigs, subset=group %in% c('LAC', 'CSS'))  ## pairwise
+survdiff(surv_model~group, data=pigs, subset=group%in%c('LAC', 'MIX'))  ## pairwise
+survdiff(surv_model~group, data=pigs, subset=group%in%c('CSS', 'MIX'))  ## pairwise
+rm(surv_model, sf, op)
+
+# severity plots
+idvars <- c('pigID', 'litter', 'farm', 'group', 'sex', 'hist.nec')
+givars <- c('clin.st','clin.je','clin.il','clin.co')
+mpigs <- melt(pigs[, c(idvars, givars)], id.vars=idvars, variable.name='site')
+tmp <- summarySE(mpigs, measurevar = 'value', groupvars = c('group', 'site'), na.rm=TRUE)
+with(tmp, ggplot(data=tmp, aes(x=site, fill=group, y=value)) + 
+		 	 geom_errorbar(aes(ymin = value - se, ymax = value + se), width = 0.2, size = 1.5,
+		 	               position = position_dodge(0.9)) + 
+		   geom_bar(stat='identity', position=position_dodge()) + 
+       scale_fill_manual(values=colors) + 
+       labs(y='mean severity score'))
+givars <- c('hist.pj', 'hist.di', 'hist.co')
+mpigs <- melt(pigs[, c(idvars, givars)], id.vars=idvars, variable.name='site')
+tmp <- summarySE(mpigs, measurevar = 'value', groupvars = c('group', 'site'), na.rm=TRUE)
+with(tmp, ggplot(data=tmp, aes(x=site, fill=group, y=value)) + 
+		 	 geom_errorbar(aes(ymin = value - se, ymax = value + se), width = 0.2, size = 1.5,
+		 	               position = position_dodge(0.9)) + 
+		   geom_bar(stat='identity', position=position_dodge()) + 
+       scale_fill_manual(values=colors) + 
+       labs(y='mean severity score'))
+
+rm(idvars, givars, mpigs, tmp)
+
+# severity stats
+sevreg <- glm(clin.st ~ group + weight.b + farm, family=gaussian, data=pigs)
+summary(glht(sevreg, linfct = mcp(group='Tukey')))
+
+sevreg <- glm(clin.je ~ group + weight.b + farm, family=gaussian, data=pigs)
+summary(glht(sevreg, linfct = mcp(group='Tukey')))
+
+sevreg <- glm(clin.il ~ group + weight.b + farm, family=gaussian, data=pigs)
+summary(glht(sevreg, linfct = mcp(group='Tukey')))
+
+sevreg <- glm(clin.co ~ group + weight.b + farm, family=gaussian, data=pigs)
+summary(glht(sevreg, linfct = mcp(group='Tukey')))
+
+sevreg <- glm(hist.pj ~ group + weight.b + farm, family=gaussian, data=pigs)
+summary(glht(sevreg, linfct = mcp(group='Tukey')))
+
+sevreg <- glm(hist.di ~ group + weight.b + farm, family=gaussian, data=pigs)
+summary(glht(sevreg, linfct = mcp(group='Tukey')))
+
+sevreg <- glm(hist.co ~ group + weight.b + farm, family=gaussian, data=pigs)
+summary(glht(sevreg, linfct = mcp(group='Tukey')))
+
+rm(sevreg)
+```
+
+## Figure 3. Bacterial quantification
+
+```{r}
+pigs <- getMJNPigs()
+cpng <- read.csv('16S_copies_per_ng.csv', strip.white=T)
+cpng$site <- factor(cpng$site, levels=c('stom','DI','colon'), ordered=T)  # force order L -> R
+cpng <- merge(pigs[, c('pigID','group','hist.nec')], cpng)
+levels(cpng$site) <- c('stomach','ileum','colon')
+cpng <- cpng[!is.na(cpng[,'copies.ng']), ]  # remove data points with no 'copies.ng' value
+cpng_c <- split(cpng,cpng$source)$contents # tissue data values too highly variable; just use contents
+
+# plot
+new_colors <- c('#000000', brightness(colors[1], seq(0.7, 0.4, length = 2)),
+                brightness(colors[2], seq(0.7, 0.4, length = 2)),
+                brightness(colors[3], seq(0.7, 0.4, length = 2)))
+cpng_c$group <- paste(cpng_c$group, cpng_c$hist.nec, sep='.')
+cpng_c$group <- factor(cpng_c$group, levels = c('NEW.Healthy', 'LAC.Healthy', 'LAC.NEC',
+                                                'MIX.Healthy', 'MIX.NEC', 'CSS.Healthy', 'CSS.NEC'),
+                       ordered = T)
+sum_c <- summarySE(cpng_c, measurevar = 'copies.ng', groupvars = c('group', 'hist.nec', 'site'))
+ggplot(sum_c, aes(x=site, y=copies.ng, fill = group)) +
+  scale_fill_manual(values = new_colors) + scale_colour_manual(values = new_colors) +
+  geom_errorbar(aes(ymin = copies.ng - se, ymax = copies.ng + se), width = 0.2,
+                position = position_dodge(width = 0.9)) +
+  geom_bar(stat = 'identity', aes(colour = group), position = position_dodge(width = 0.9)) +
+  scale_y_log10(trans_breaks('log10', function(x) 10^x)(c(1, 200000)),
+                labels = trans_format('log10', math_format(10^.x))) +
+  labs(list(title = 'Bacterial Load in Contents', x = element_blank(), y = '16S copies/ng DNA')) +
+  theme(panel.background = element_blank(), panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), axis.line = element_line(colour = 'black'),
+        axis.title.x = element_text(vjust = -0.5), axis.title.y = element_text(vjust = 1.5),
+        text = element_text(face = 'bold', size = 18), axis.text = element_text(color = 'black'),
+        legend.title = element_blank(), legend.position = 'right') +
+  guides(colour=guide_legend(nrow=1, byrow=T))
+
+# test for differences
+stom <- split(cpng_c, cpng_c$site)$stomach
+ile <- split(cpng_c, cpng_c$site)$ileum
+colo <- split(cpng_c, cpng_c$site)$colon
+pairwise.wilcox.test(stom$copies.ng, stom$group, p.adj = 'holm')
+pairwise.wilcox.test(ile$copies.ng, ile$group, p.adj = 'holm')
+pairwise.wilcox.test(colo$copies.ng, colo$group, p.adj = 'holm')
+
+rm(stom, ile, colo, cpng, cpng_c, sum_c, new_colors)
+```
+
+## Figure 4. Microbiota richness and diversity
+
+```{r}
+# define file locations
+biom_file <- 'str_MJN_w_newborn_samples_removed___.biom'
+tree_file <- 'silva123_V4.tre'
+mapping_file <- 'MJN_w_newborn_samples_mappingfile_allmd_new_as_healthy_phyloseq.csv'
+
+# create phyloseq object from input files
+ps <- import_biom(biom_file, tree_file)
+sample_names(ps) <- make.names(sample_names(ps))
+sd <- sample_data(read.csv(mapping_file, row.names = 1))
+row.names(sd) <- make.names(row.names(sd))
+ps <- merge_phyloseq(ps, sd)
+colnames(tax_table(ps)) <- c('Domain', 'Phylum', 'Class', 'Order', 'Family', 'Genus')
+sample_data(ps)$group <- factor(sample_data(ps)$group, levels = c('NEW', 'LAC', 'MIX', 'CSS'))
+sample_data(ps)$site <- factor(sample_data(ps)$site, levels = c('Stomach', 'Ileum', 'Colon'))
+sample_data(ps)$NEC.group <- factor(sample_data(ps)$NEC.group,
+                                    levels = c('NEW', 'Healthy-LAC', 'Healthy-MIX', 'Healthy-CSS',
+                                               'NEC-LAC', 'NEC-MIX', 'NEC-CSS'))
+
+# remove spurious taxa
+ps <- subset_taxa(ps, Domain == 'Bacteria')
+
+# Make a data frame with a column for the read counts of each sample
+sample_sum_df <- data.frame(sum = sample_sums(ps)) 
+
+# Histogram of sample read counts
+#   by sample type (tissue v contents)
+ggplot(merge(sample_sum_df, sample_data(ps), by = 'row.names'), aes(x = sum)) +  facet_grid( ~ type) +
+  geom_histogram(binwidth = 500) +
+  ggtitle('Distribution of sample sequencing depth (red line = 1000)') + 
+  xlab('Read counts (bin=500)') +
+  xlim(-500, NA) +  # -500 to ensure all data are displayed on chart; NA to set limit to data max
+  geom_vline(xintercept = 1000, linetype = 'dashed', color = 'red') +
+  theme(axis.title.y = element_blank())
+#   by all categories (site, type, group, NEC)
+ggplot(merge(sample_sum_df, sample_data(ps), by = 'row.names'), aes(x = sum)) +
+  facet_grid(type + group ~ site + NEC) +
+  geom_histogram(binwidth = 500) + theme_bw() +
+  ggtitle('Distribution of sample sequencing depth (red line = 1000)') + 
+  xlab('Read counts (bin=500)') +
+  xlim(-500, NA) +  # -500 to ensure all data are displayed on chart; NA to set limit to data max
+  geom_vline(xintercept = 1000, linetype = 'dashed', color = 'red') +
+  theme(axis.title.y = element_blank())
+
+# remove samples with low read counts
+ps <- prune_samples(sample_sums(ps) >= 1000, ps)
+
+# subset into tissue and contents
+ps.t <- subset_samples(ps, type == 'Tissue')
+ps.c <- subset_samples(ps, type == 'Contents')
+
+# subset into Healthy and NEC
+ps.t.h <- subset_samples(ps.t, NEC == 'Healthy')
+ps.t.n <- subset_samples(ps.t, NEC == 'NEC')
+ps.c.h <- subset_samples(ps.c, NEC == 'Healthy')
+ps.c.n <- subset_samples(ps.c, NEC == 'NEC')
+
+# remove OTUs which are present in 0 samples
+ps <- prune_taxa(taxa_sums(ps) > 0, ps)
+ps.t <- prune_taxa(taxa_sums(ps.t) > 0, ps.t)
+ps.t.h <- prune_taxa(taxa_sums(ps.t.h) > 0, ps.t.h)
+ps.t.n <- prune_taxa(taxa_sums(ps.t.n) > 0, ps.t.n)
+ps.c <- prune_taxa(taxa_sums(ps.c) > 0, ps.c)
+ps.c.h <- prune_taxa(taxa_sums(ps.c.h) > 0, ps.c.h)
+ps.c.n <- prune_taxa(taxa_sums(ps.c.n) > 0, ps.c.n)
+
+rich.c <- merge(estimate_richness(ps.c, measures = c('Observed', 'InvSimpson')),
+                sample_data(ps.c), by = 'row.names')
+rich.t <- merge(estimate_richness(ps.t, measures = c('Observed', 'InvSimpson')),
+                sample_data(ps.t), by = 'row.names')
+rich.c.h <- merge(estimate_richness(ps.c.h, measures = c('Observed', 'InvSimpson')),
+                  sample_data(ps.c.h), by = 'row.names')
+rich.c.n <- merge(estimate_richness(ps.c.n, measures = c('Observed', 'InvSimpson')),
+                  sample_data(ps.c.n), by = 'row.names')
+rich.t.h <- merge(estimate_richness(ps.t.h, measures = c('Observed', 'InvSimpson')),
+                  sample_data(ps.t.h), by = 'row.names')
+rich.t.n <- merge(estimate_richness(ps.t.n, measures = c('Observed', 'InvSimpson')),
+                  sample_data(ps.t.n), by = 'row.names')
+
+gg1 <- ggplot(rich.c.h, aes(x = site, y = Observed, color = group)) +
+  geom_boxplot(lwd = 1, position = position_dodge(width = 0.85), width = 0.7, outlier.shape = NA) +
+  geom_point(shape = 19, position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.85)) +
+  scale_colour_manual(values = group_colors) +
+  labs(list(title = 'Obs, Healthy, Contents', x = element_blank(), y = element_blank())) +
+  ylim(0, 80)
+gg2 <- ggplot(rich.c.n, aes(x = site, y = Observed, color = group)) +
+  geom_boxplot(lwd = 1, position = position_dodge(width = 0.85), width = 0.7, outlier.shape = NA) +
+  geom_point(shape = 19, position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.85)) +
+  scale_colour_manual(values = group_colors[2:4]) + scale_y_continuous(breaks = NULL, limits = c(0, 80)) +
+  labs(list(title = 'Obs, NEC, Contents', x = element_blank(), y = element_blank())) 
+grid.arrange(gg1, gg2, ncol = 2)  
+
+gg1 <- ggplot(rich.c.h, aes(x = site, y = InvSimpson, color = group)) +
+  geom_boxplot(lwd = 1, position = position_dodge(width = 0.85), width = 0.7, outlier.shape = NA) +
+  geom_point(shape = 19, position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.85)) +
+  scale_colour_manual(values = group_colors) +
+  labs(list(title = 'InvS, Healthy, Contents', x = element_blank(), y = element_blank())) +
+  ylim(0, 15)
+gg2 <- ggplot(rich.c.n, aes(x = site, y = InvSimpson, color = group)) +
+  geom_boxplot(lwd = 1, position = position_dodge(width = 0.85), width = 0.7, outlier.shape = NA) +
+  geom_point(shape = 19, position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.85)) +
+  scale_colour_manual(values = group_colors[2:4]) + scale_y_continuous(breaks = NULL, limits = c(0, 15)) +
+  labs(list(title = 'InvS, NEC, Contents', x = element_blank(), y = element_blank()))
+grid.arrange(gg1, gg2, ncol = 2)
+
+gg1 <- ggplot(rich.t.h, aes(x = site, y = Observed, color = group)) +
+  geom_boxplot(lwd = 1, position = position_dodge(width = 0.85), width = 0.7, outlier.shape = NA) +
+  geom_point(shape = 19, position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.85)) +
+  scale_colour_manual(values = group_colors) +
+  labs(list(title = 'Obs, Healthy, Tissue', x = element_blank(), y = element_blank())) +
+  ylim(0, 80)
+gg2 <- ggplot(rich.t.n, aes(x = site, y = Observed, color = group)) +
+  geom_boxplot(lwd = 1, position = position_dodge(width = 0.85), width = 0.7, outlier.shape = NA) +
+  geom_point(shape = 19, position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.85)) +
+  scale_colour_manual(values = group_colors[2:4]) + scale_y_continuous(breaks = NULL, limits = c(0, 80)) +
+  labs(list(title = 'Obs, NEC, Tissue', x = element_blank(), y = element_blank()))
+grid.arrange(gg1, gg2, ncol = 2)  
+
+gg1 <- ggplot(rich.t.h, aes(x = site, y = InvSimpson, color = group)) +
+  geom_boxplot(lwd = 1, position = position_dodge(width = 0.85), width = 0.7, outlier.shape = NA) +
+  geom_point(shape = 19, position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.85)) +
+  scale_colour_manual(values = group_colors) +
+  labs(list(title = 'InvS, Healthy, Tissue', x = element_blank(), y = element_blank())) +
+  ylim(0, 15)
+gg2 <- ggplot(rich.t.n, aes(x = site, y = InvSimpson, color = group)) +
+  geom_boxplot(lwd = 1, position = position_dodge(width = 0.85), width = 0.7, outlier.shape = NA) +
+  geom_point(shape = 19, position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.85)) +
+  scale_colour_manual(values = group_colors[2:4]) + scale_y_continuous(breaks = NULL, limits = c(0, 15)) +
+  labs(list(title = 'InvS, NEC, Tissue', x = element_blank(), y = element_blank()))  
+grid.arrange(gg1, gg2, ncol = 2)
+
+# test for significant differences in richness and alpha diversity
+summary(glht(glm(Observed ~ group, family = gaussian, data = rich.c.h), linfct = mcp(group = 'Tukey')))
+summary(glht(glm(Observed ~ group, family = gaussian, data = rich.c.n), linfct = mcp(group = 'Tukey')))
+summary(glht(glm(InvSimpson ~ group, family = gaussian, data = rich.c.h), linfct = mcp(group = 'Tukey')))
+summary(glht(glm(InvSimpson ~ group, family = gaussian, data = rich.c.n), linfct = mcp(group = 'Tukey')))
+summary(glht(glm(Observed ~ group, family = gaussian, data = rich.t.h), linfct = mcp(group = 'Tukey')))
+summary(glht(glm(Observed ~ group, family = gaussian, data = rich.t.n), linfct = mcp(group = 'Tukey')))
+summary(glht(glm(InvSimpson ~ group, family = gaussian, data = rich.t.h), linfct = mcp(group = 'Tukey')))
+summary(glht(glm(InvSimpson ~ group, family = gaussian, data = rich.t.n), linfct = mcp(group = 'Tukey')))
+
+
+```
+
+## Figure 5. Overview - class level
+
+```{r}
+# subset by GI tract site
+ps.t.il <- subset_samples(ps.t, site == 'Ileum')
+ps.t.co <- subset_samples(ps.t, site == 'Colon')
+ps.t.ilco <- subset_samples(ps.t, site %in% c('Ileum', 'Colon'))
+ps.c.st <- subset_samples(ps.c, site == 'Stomach')
+ps.c.il <- subset_samples(ps.c, site == 'Ileum')
+ps.c.co <- subset_samples(ps.c, site == 'Colon')
+ps.c.ilco <- subset_samples(ps.c, site %in% c('Ileum', 'Colon'))
+
+# transform abundances from absolute to relative (proportions)
+ps.t.il.rel <- transform_sample_counts(ps.t.il, function(x) x / sum(x))
+ps.t.co.rel <- transform_sample_counts(ps.t.co, function(x) x / sum(x))
+ps.t.ilco.rel <- transform_sample_counts(ps.t.ilco, function(x) x / sum(x))
+ps.c.st.rel <- transform_sample_counts(ps.c.st, function(x) x / sum(x))
+ps.c.il.rel <- transform_sample_counts(ps.c.il, function(x) x / sum(x))
+ps.c.co.rel <- transform_sample_counts(ps.c.co, function(x) x / sum(x))
+ps.c.ilco.rel <- transform_sample_counts(ps.c.ilco, function(x) x / sum(x))
+
+# remove OTUs whose relative abundance is not at least 0.01 in at least one sample
+#    (i.e., remove OTUs whose max relative abundance is less than 0.01)
+ps.t.il.rel.fil <- prune_taxa(apply(otu_table(ps.t.il.rel), 1, max) > 0.01, ps.t.il.rel)
+ps.t.co.rel.fil <- prune_taxa(apply(otu_table(ps.t.co.rel), 1, max) > 0.01, ps.t.co.rel)
+ps.t.ilco.rel.fil <- prune_taxa(apply(otu_table(ps.t.ilco.rel), 1, max) > 0.01, ps.t.ilco.rel)
+ps.c.st.rel.fil <- prune_taxa(apply(otu_table(ps.c.st.rel), 1, max) > 0.01, ps.c.st.rel)
+ps.c.il.rel.fil <- prune_taxa(apply(otu_table(ps.c.il.rel), 1, max) > 0.01, ps.c.il.rel)
+ps.c.co.rel.fil <- prune_taxa(apply(otu_table(ps.c.co.rel), 1, max) > 0.01, ps.c.co.rel)
+ps.c.ilco.rel.fil <- prune_taxa(apply(otu_table(ps.c.ilco.rel), 1, max) > 0.01, ps.c.ilco.rel)
+
+# agglomerate OTUs by class
+ps.t.il.rel.fil.class <- tax_glom(ps.t.il.rel.fil, 'Class')
+ps.t.co.rel.fil.class <- tax_glom(ps.t.co.rel.fil, 'Class')
+ps.t.ilco.rel.fil.class <- tax_glom(ps.t.ilco.rel.fil, 'Class')
+ps.c.st.rel.fil.class <- tax_glom(ps.c.st.rel.fil, 'Class')
+ps.c.il.rel.fil.class <- tax_glom(ps.c.il.rel.fil, 'Class')
+ps.c.co.rel.fil.class <- tax_glom(ps.c.co.rel.fil, 'Class')
+ps.c.ilco.rel.fil.class <- tax_glom(ps.c.ilco.rel.fil, 'Class')
+
+# print relative abundances (Class level) to files for plotting stacked bar graphs
+vars <- c('pigID', 'site', 'type', 'diet', 'NEC')
+otus <- otu_table(ps.t.il.rel.fil.class)
+row.names(otus)  <- tax_table(ps.t.il.rel.fil.class)[, 3]
+metadata <- sample_data(ps.t.il.rel.fil.class)[, vars]
+write.csv(merge(metadata, t(otus), by = 'row.names'), 't.il.rel.fil.class.csv', row.names = F)
+
+otus <- otu_table(ps.t.co.rel.fil.class)
+row.names(otus)  <- tax_table(ps.t.co.rel.fil.class)[, 3]
+metadata <- sample_data(ps.t.co.rel.fil.class)[, vars]
+write.csv(merge(metadata, t(otus), by = 'row.names'), 't.co.rel.fil.class.csv', row.names = F)
+
+otus <- otu_table(ps.c.st.rel.fil.class)
+row.names(otus)  <- tax_table(ps.c.st.rel.fil.class)[, 3]
+metadata <- sample_data(ps.c.st.rel.fil.class)[, vars]
+write.csv(merge(metadata, t(otus), by = 'row.names'), 'c.st.rel.fil.class.csv', row.names = F)
+
+otus <- otu_table(ps.c.il.rel.fil.class)
+row.names(otus)  <- tax_table(ps.c.il.rel.fil.class)[, 3]
+metadata <- sample_data(ps.c.il.rel.fil.class)[, vars]
+write.csv(merge(metadata, t(otus), by = 'row.names'), 'c.il.rel.fil.class.csv', row.names = F)
+
+otus <- otu_table(ps.c.co.rel.fil.class)
+row.names(otus)  <- tax_table(ps.c.co.rel.fil.class)[, 3]
+metadata <- sample_data(ps.c.co.rel.fil.class)[, vars]
+write.csv(merge(metadata, t(otus), by = 'row.names'), 'c.co.rel.fil.class.csv', row.names = F)
+
+# barplots can then be created using excel
+```
+
+## Figure 6. Healthy vs NEC (all fed) - class level
+
+Created using CMMR analysis server (local) as follows:  the biom file and mapping file were uploaded, read counts were rarefied to ~2500 reads/sample, sequences were grouped to the class level, samples were split by GI site (stomach/ileum/colon) and sample type (tissue/contents), and comparisons between Healthy and NEC were made for the top classes using Holm-adjusted Mann-Whitney U tests.
+
+## Figure 7. Microbiota diet-driven changes (healthy) - genus level
+
+Created using CMMR analysis server (local) as follows:  the biom file and mapping file were uploaded, read counts were rarefied to ~2500 reads/sample, sequences were grouped to the genus level, samples were split by GI site (stomach/ileum/colon) and sample type (tissue/contents), and comparisons between diet groups were made for the top genera using Holm-adjusted Kruskal-Wallis tests.
+
+## Figure 8. Healthy vs NEC (all fed) - genus level
+
+Created using CMMR analysis server (local) as follows:  the biom file and mapping file were uploaded, read counts were rarefied to ~2500 reads/sample, sequences were grouped to the genus level, samples were split by GI site (stomach/ileum/colon) and sample type (tissue/contents), and comparisons between Healthy and NEC were made for the top taxa using Holm-adjusted Mann-Whitney U tests.
+
+## Figure 9. Healthy vs NEC (CSS only) - genus level
+
+Created using CMMR analysis server (local) as follows:  the biom file and mapping file were uploaded, read counts were rarefied to ~2500 reads/sample, sequences were grouped to the genus level, samples were split by GI site (stomach/ileum/colon) and sample type (tissue/contents), and comparisons between Healthy and NEC were made for the top taxa using Holm-adjusted Mann-Whitney U tests.
+
+## Figure 10. Metabolites overview (all fed)
+
+```{r}
+# load data
+c.cmpds <- read.csv('cecal_compounds.csv', strip.white = T)
+cecal <- read.csv('cecal.csv', strip.white = T)  # "COMP ID" uniquely identifies compounds
+p.cmpds <- read.csv('plasma_compounds.csv', strip.white = T)
+plasma <- read.csv('plasma.csv', strip.white = T)
+pigs <- getMJNPigs(incl.new = F)
+cecal <- merge(pigs, cecal)
+plasma <- merge(pigs, plasma)
+
+# get column names for compounds
+c.compIDs <- names(cecal)[!(names(cecal) %in% c(names(pigs), 'mass.dry.g', 'bradford.protein'))]
+p.compIDs <- names(plasma)[!(names(plasma) %in% names(pigs))]
+
+# remove compounds that have no values (i.e. were only found in 'NEW' pigs)
+#  cecal
+c.compIDs.toFilter <- names(which(colSums(cecal[, c.compIDs], na.rm = T) == 0))
+cecal <- cecal[!names(cecal) %in% c.compIDs.toFilter]
+c.compIDs <- setdiff(c.compIDs, c.compIDs.toFilter)
+#  plasma
+p.compIDs.toFilter <- names(which(colSums(plasma[, p.compIDs], na.rm = T) == 0))
+plasma <- plasma[!names(plasma) %in% p.compIDs.toFilter]
+p.compIDs <- setdiff(p.compIDs, p.compIDs.toFilter)
+
+# normalize concentration measurements for each cecal sample - divide by dry mass of sample
+cecal[, c.compIDs] <- sweep(cecal[, c.compIDs], 1, cecal[, 'mass.dry.g'], '/')
+
+# replace 0s and NA (missing values) w/ 1/2 column minimum
+#  cecal
+c.colmins <- apply(cecal[, c.compIDs], 2, function(x){ min(x, na.rm = T) })
+c.nas <- which(is.na(cecal), arr.ind = T)
+c.nas <- c.nas[which(c.nas[, 2] > ncol(cecal) - length(c.compIDs)), ]
+cecal[c.nas] <- c.colmins[c.nas[, 2] - (ncol(cecal) - length(c.compIDs))] / 2
+#  plasma
+p.colmins <- apply(plasma[, p.compIDs], 2, function(x){ min(x, na.rm = T) })
+p.nas <- which(is.na(plasma), arr.ind = T)
+p.nas <- p.nas[which(p.nas[, 2] > ncol(plasma) - length(p.compIDs)), ]
+plasma[p.nas] <- p.colmins[p.nas[, 2] - (ncol(plasma) - length(p.compIDs))] / 2
+
+# save absolute values to use for calculating fold-change
+c.abs <- cecal
+p.abs <- plasma
+
+# transform values by generalized log
+cecal[, c.compIDs] <- apply(cecal[, c.compIDs], 2, function(x) { log2((x + sqrt(x^2 + 1)) / 2) })
+plasma[, p.compIDs] <- apply(plasma[, p.compIDs], 2, function(x) { log2((x + sqrt(x^2 + 1)) / 2) })
+
+# scale values by autoscaling (force each variable to have mean = 0 and sd = 1)
+cecal[, c.compIDs] <- apply(cecal[, c.compIDs], 2, function(x) { (x - mean(x)) / sd(x) })
+plasma[, p.compIDs] <- apply(plasma[, p.compIDs], 2, function(x) { (x - mean(x)) / sd(x) })
+
+# change column names from 'c.#####' or 'p.#####' format to biochemical name
+#  cecal
+c.cmpds$colnamesID <- paste('c.', c.cmpds$comp.id, sep='')
+c.comp.names <- as.character(c.cmpds$biochemical[na.omit(match(colnames(cecal), c.cmpds$colnamesID))])
+colnames(cecal)[colnames(cecal) %in% c.compIDs] <- c.comp.names
+colnames(c.abs)[colnames(c.abs) %in% c.compIDs] <- c.comp.names
+# plasma
+p.cmpds$colnamesID <- paste('p.', p.cmpds$comp.id, sep='')
+p.comp.names <- as.character(p.cmpds$biochemical[na.omit(match(colnames(plasma), p.cmpds$colnamesID))])
+colnames(plasma)[colnames(plasma) %in% p.compIDs] <- p.comp.names
+colnames(p.abs)[colnames(p.abs) %in% p.compIDs] <- p.comp.names
+
+c.fed <- droplevels(cecal[cecal$group %in% c('LAC', 'MIX', 'CSS'), ])
+p.fed <- droplevels(plasma[plasma$group %in% c('LAC', 'MIX', 'CSS'), ])
+
+# plasma
+# get top metabolites to plot, according to type II SS for hist.nec
+p.anova <- as.data.frame(apply(p.fed[, as.character(p.comp.names)], 2,
+                               function(x) anova(lm(x ~ p.fed$group * p.fed$hist.nec))$'Pr(>F)'[2:3]))
+p.anova[1, ] <- p.adjust(p.anova[1, ], method = 'fdr')
+p.metabs.plot <- names(p.anova[which(p.anova[1, ] < 0.01)])[1:50]
+
+# plot heatmap
+p.mat <- t(as.matrix.data.frame(plasma[order(plasma$hist.nec, plasma$group), p.metabs.plot]))
+colnames(p.mat) <- plasma[order(plasma$hist.nec, plasma$group), 'pigID']
+annot.df <- plasma[, c('hist.nec', 'group')]
+annot.df[, 'hist.nec'] <- as.character(annot.df[, 'hist.nec'])
+annot.df[, 'group'] <- as.character(annot.df[, 'group'])
+rownames(annot.df) <- plasma$pigID
+ann.colors <- list(hist.nec = c('Healthy' = hn_colors[1], 'NEC' = hn_colors[2]),
+                   group = c('LAC' = diet_colors[1], 'MIX' = diet_colors[2], 'CSS' = diet_colors[3]))
+pheatmap(p.mat,
+         cluster_rows = T, 
+         cluster_cols = F,
+         color = rev(colorRampPalette(brewer.pal(8, "RdBu"))(256)),
+         annotation = annot.df,
+         annotation_colors = ann.colors,
+         clustering_distance_rows = 'euclidean',
+         clustering_method = 'ward.D',
+         border_color = 'gray',
+         scale = 'none',
+         gaps_col = length(which(annot.df[, 'hist.nec'] == 'Healthy')),
+         show_colnames = F,
+         main = 'Plasma')
+
+# cecal
+# get top metabolites to plot, according to type II SS for hist.nec
+c.anova <- as.data.frame(apply(c.fed[, as.character(c.comp.names)], 2,
+                               function(x) anova(lm(x ~ c.fed$group * c.fed$hist.nec))$'Pr(>F)'[2:3]))
+c.anova[1, ] <- p.adjust(c.anova[1, ], method = 'fdr')
+c.metabs.plot <- names(c.anova[which(c.anova[1, ] < 0.01)])[1:50]
+
+# plot heatmap
+c.mat <- t(as.matrix.data.frame(cecal[order(cecal$hist.nec, cecal$group), c.metabs.plot]))
+colnames(c.mat) <- cecal[order(cecal$hist.nec, cecal$group), 'pigID']
+annot.df <- cecal[, c('hist.nec', 'group')]
+annot.df[, 'hist.nec'] <- as.character(annot.df[, 'hist.nec'])
+annot.df[, 'group'] <- as.character(annot.df[, 'group'])
+rownames(annot.df) <- cecal$pigID
+ann.colors <- list(hist.nec = c('Healthy' = hn_colors[1], 'NEC' = hn_colors[2]),
+                   group = c('LAC' = diet_colors[1], 'MIX' = diet_colors[2], 'CSS' = diet_colors[3]))
+pheatmap(c.mat,
+         cluster_rows = T, 
+         cluster_cols = F,
+         color = rev(colorRampPalette(brewer.pal(8, "RdBu"))(256)),
+         annotation = annot.df,
+         annotation_colors = ann.colors,
+         clustering_distance_rows = 'euclidean',
+         clustering_method = 'ward.D',
+         border_color = 'gray',
+         scale = 'none',
+         gaps_col = length(which(annot.df[, 'hist.nec'] == 'Healthy')),
+         show_colnames = F,
+         main = 'Cecal')
+
+rm(c.abs, c.anova, c.cmpds, c.fed, c.mat, c.nas, cecal, p.abs, p.anova, p.cmpds, p.fed, p.mat,
+   p.nas, plasma, pigs, c.colmins, c.comp.names, c.compIDs, c.compIDs.toFilter, c.metabs.plot,
+   p.colmins, p.comp.names, p.compIDs, p.compIDs.toFilter, p.metabs.plot, annot.df, ann.colors)
+```
+
+
+## Figure 11. Metabolite diet-driven changes (healthy)
+Created using Metaboanalyst.ca as follows:  a table containing the raw abundance values was uploaded, compound abundances were pre-processed, transformed and scaled exactly as done above for figures 10-13, the top 50 most significant compounds by ANOVA were used for heirarchical clustering and displayed as a heatmap.
+
+## Figure 12. Selected plasma metabolites
+
+```{r}
+theme_set(theme_classic())
+theme_update(plot.title = element_text(hjust = 0.5))
+
+# reload data including all newborn pigs as well as fed pigs
+c.cmpds <- read.csv('cecal_compounds.csv', strip.white = T)
+cecal <- read.csv('cecal.csv', strip.white = T)  # "COMP ID" uniquely identifies compounds
+p.cmpds <- read.csv('plasma_compounds.csv', strip.white = T)
+plasma <- read.csv('plasma.csv', strip.white = T)
+pigs <- getMJNPigs(incl.new = T)
+cecal <- merge(pigs, cecal)
+plasma <- merge(pigs, plasma)
+
+# get column names for compounds
+c.compIDs <- names(cecal)[!(names(cecal) %in% c(names(pigs), 'mass.dry.g', 'bradford.protein'))]
+p.compIDs <- names(plasma)[!(names(plasma) %in% names(pigs))]
+
+# normalize concentration measurements for each cecal sample - divide by dry mass of sample
+cecal[, c.compIDs] <- sweep(cecal[, c.compIDs], 1, cecal[, 'mass.dry.g'], '/')
+
+# replace 0s and NA (missing values) w/ 1/2 column minimum
+#  cecal
+c.colmins <- apply(cecal[, c.compIDs], 2, function(x){ min(x, na.rm = T) })
+c.nas <- which(is.na(cecal), arr.ind = T)
+c.nas <- c.nas[which(c.nas[, 2] > ncol(cecal) - length(c.compIDs)), ]
+cecal[c.nas] <- c.colmins[c.nas[, 2] - (ncol(cecal) - length(c.compIDs))] / 2
+#  plasma
+p.colmins <- apply(plasma[, p.compIDs], 2, function(x){ min(x, na.rm = T) })
+p.nas <- which(is.na(plasma), arr.ind = T)
+p.nas <- p.nas[which(p.nas[, 2] > ncol(plasma) - length(p.compIDs)), ]
+plasma[p.nas] <- p.colmins[p.nas[, 2] - (ncol(plasma) - length(p.compIDs))] / 2
+
+# save absolute values to use for calculating fold-change
+c.abs <- cecal
+p.abs <- plasma
+
+# transform values by generalized log
+cecal[, c.compIDs] <- apply(cecal[, c.compIDs], 2, function(x) { log2((x + sqrt(x^2 + 1)) / 2) })
+plasma[, p.compIDs] <- apply(plasma[, p.compIDs], 2, function(x) { log2((x + sqrt(x^2 + 1)) / 2) })
+
+# scale values by autoscaling (force each variable to have mean = 0 and sd = 1)
+cecal[, c.compIDs] <- apply(cecal[, c.compIDs], 2, function(x) { (x - mean(x)) / sd(x) })
+plasma[, p.compIDs] <- apply(plasma[, p.compIDs], 2, function(x) { (x - mean(x)) / sd(x) })
+
+# change column names from 'c.#####' or 'p.#####' format to biochemical name
+#  cecal
+c.cmpds$colnamesID <- paste('c.', c.cmpds$comp.id, sep='')
+c.comp.names <- as.character(c.cmpds$biochemical[na.omit(match(colnames(cecal), c.cmpds$colnamesID))])
+colnames(cecal)[colnames(cecal) %in% c.compIDs] <- c.comp.names
+colnames(c.abs)[colnames(c.abs) %in% c.compIDs] <- c.comp.names
+# plasma
+p.cmpds$colnamesID <- paste('p.', p.cmpds$comp.id, sep='')
+p.comp.names <- as.character(p.cmpds$biochemical[na.omit(match(colnames(plasma), p.cmpds$colnamesID))])
+colnames(plasma)[colnames(plasma) %in% p.compIDs] <- p.comp.names
+colnames(p.abs)[colnames(p.abs) %in% p.compIDs] <- p.comp.names
+
+# add factor to allow plotting by group-NEC
+cecal <- cbind(cecal, 'group-NEC' = paste(cecal[, 'group'], cecal[, 'hist.nec'], sep = '-'))
+levels(cecal$'group-NEC')[levels(cecal$'group-NEC') == 'NEW-Healthy'] <- 'NEW'
+cecal$'group-NEC' <- factor(cecal$'group-NEC',
+                            levels = c('NEW', 'LAC-Healthy', 'LAC-NEC', 'MIX-Healthy', 'MIX-NEC',
+                                       'CSS-Healthy', 'CSS-NEC'))
+plasma <- cbind(plasma, 'group-NEC' = paste(plasma[, 'group'], plasma[, 'hist.nec'], sep = '-'))
+levels(plasma$'group-NEC')[levels(plasma$'group-NEC') == 'NEW-Healthy'] <- 'NEW'
+plasma$'group-NEC' <- factor(plasma$'group-NEC',
+                             levels = c('NEW', 'LAC-Healthy', 'LAC-NEC', 'MIX-Healthy', 'MIX-NEC',
+                                        'CSS-Healthy', 'CSS-NEC'))
+
+# 7 group plots for plasma metabolites
+plot.df <- plasma  
+plot.cmpds <- c('glucose', '1,6-anhydroglucose', 'acetylcarnitine',
+                '1,3-propanediol', '3-aminoisobutyrate', 'p-cresol sulfate',
+                '2-palmitoylglycerophosphoethanolamine', 'taurocholate', 'lactate')
+for (plot.cmpd in plot.cmpds) {
+  plot <- ggplot(plot.df, aes(x = plot.df$'group-NEC', y = plot.df[, plot.cmpd],
+                              color = plot.df$'group-NEC')) +
+            geom_boxplot(lwd = 1, position = position_dodge(width = 0.85), width = 0.7,
+                         outlier.shape = NA) +
+            geom_point(shape = 19, position = position_jitterdodge(jitter.width = 0.15,
+                                                                   dodge.width = 0.85)) +
+            scale_colour_manual(values = group_NEC_colors) + theme(legend.position = 'none') +
+            labs(list(title = plot.cmpd, x = element_blank(), y = 'Relative Concentration')) +
+            theme(axis.text.x = element_text(angle = -30, hjust = 0))
+  print(plot)
+}
+
+```
+
+## Figure 13. Selected cecal metabolites
+
+```{r}
+# 7 group plots for cecal metabolites
+plot.df <- cecal
+plot.cmpds <- c('alpha-muricholate', 'nicotinamide adenine dinucleotide (NAD+)',
+                'phenylacetate', 'serotonin (5HT)', 'lactate',
+                'threonate', 'palmitoyl ethanolamide',
+                'glucose', 'dihomo-linoleate (20:2n6)')
+for (plot.cmpd in plot.cmpds) {
+  plot <- ggplot(plot.df, aes(x = plot.df$'group-NEC', y = plot.df[, plot.cmpd],
+                              color = plot.df$'group-NEC')) +
+    geom_boxplot(lwd = 1, position = position_dodge(width = 0.85), width = 0.7, outlier.shape = NA) +
+    geom_point(shape = 19, position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.85)) +
+    scale_colour_manual(values = group_NEC_colors) + theme(legend.position = 'none') +
+    labs(list(title = plot.cmpd, x = element_blank(), y = 'Relative Concentration')) +
+    theme(axis.text.x = element_text(angle = -30, hjust = 0))
+  print(plot)
+}
+
+rm(c.abs, c.cmpds, c.nas, cecal, p.abs, p.cmpds, p.nas, plasma, pigs, c.colmins, c.comp.names,
+   c.compIDs, p.colmins, p.comp.names, p.compIDs, plot.cmpd, plot.cmpds, plot, plot.df)
+```
+
+## Additional file 1. Cytokine expression
+
+```{r}
+pigs <- getMJNPigs() # need all pigs including NEW
+exp = read.csv('DI_cytokines.csv', strip.white=T)
+exp <- merge(pigs[, c('pigID', 'group', 'hist.nec')], exp)
+
+brightness <- function(rgbcol, v) {
+  conv <- as.list(as.data.frame(t(rgb2hsv(col2rgb(rgbcol)))))
+  conv[[3]] <- v
+  do.call(hsv, conv)
+}  
+
+# x=gene, dodge by groups and/or NEC
+exp$group.nec <- paste(exp$group, exp$hist.nec, sep='.')
+exp$group.nec <- factor(exp$group.nec,
+                        levels = c('NEW.Healthy', 'LAC.Healthy', 'LAC.NEC','MIX.Healthy', 'MIX.NEC',
+                                   'CSS.Healthy', 'CSS.NEC'), ordered = T)
+sum_c <- summarySE(exp, measurevar = 'rel.exp', groupvars = c('group.nec', 'hist.nec', 'gene'), na.rm=T)
+genes <- levels(sum_c$gene)
+for (g in genes) {
+  plot <- ggplot(sum_c[sum_c$gene == g, ], aes(x=gene, y=rel.exp, fill = group.nec)) +
+            scale_fill_manual(values = group_NEC_colors) + 
+            scale_colour_manual(values = group_NEC_colors) +
+            geom_errorbar(aes(ymin = rel.exp - se, ymax = rel.exp + se), width = 0.2, 
+                          position = position_dodge(width = 0.9)) +
+            geom_bar(stat = 'identity', aes(colour = group.nec), position = position_dodge(width = 0.9)) +
+            labs(list(title = element_blank(), x = element_blank(), y = 'Relative Expression')) +
+            theme(panel.background = element_blank(), panel.grid.major = element_blank(),
+                  panel.grid.minor = element_blank(), axis.line = element_line(colour='black'),
+                  axis.title.x = element_text(vjust=-0.5), axis.title.y = element_text(vjust = 1.5),
+                  text = element_text(face = 'bold', size = 18),
+                  axis.text = element_text(color = 'black'),
+                  legend.title = element_blank(), legend.position = 'right') +
+            guides(colour = guide_legend(nrow = 1, byrow = T))
+  print(plot)
+  print(with(exp[exp$gene == g, ], pairwise.wilcox.test(rel.exp, group.nec, p.adj = 'holm')))
+}
+
+rm(pigs, exp, sum_c, g, genes, plot)
+```
+
+## Additional file 2. Microbiota heatmap (ileum tissue) - genus level
+
+```{r}
+# agglomerate OTUs by genus
+names.b.e = c('NA', '', ' ', '\t', 'uncultured', 'g', 'Incertae_Sedis')
+ps.t.il.rel.fil.genus <- tax_glom(ps.t.il.rel.fil, 'Genus', bad_empty = names.b.e)
+ps.t.co.rel.fil.genus <- tax_glom(ps.t.co.rel.fil, 'Genus', bad_empty = names.b.e)
+ps.t.ilco.rel.fil.genus <- tax_glom(ps.t.ilco.rel.fil, 'Genus', bad_empty = names.b.e)
+ps.c.st.rel.fil.genus <- tax_glom(ps.c.st.rel.fil, 'Genus', bad_empty = names.b.e)
+ps.c.il.rel.fil.genus <- tax_glom(ps.c.il.rel.fil, 'Genus', bad_empty = names.b.e)
+ps.c.co.rel.fil.genus <- tax_glom(ps.c.co.rel.fil, 'Genus', bad_empty = names.b.e)
+ps.c.ilco.rel.fil.genus <- tax_glom(ps.c.ilco.rel.fil, 'Genus', bad_empty = names.b.e)
+
+# plot heatmaps
+sort.df <- get_variable(ps.t.il.rel.fil.genus, c('pigID', 'NEC.group'))
+plot_heatmap(ps.t.il.rel.fil.genus, 'PCoA', 'jaccard', sample.label = 'NEC.group',
+             taxa.label = 'Genus', 
+             sample.order = row.names(sort.df[order(sort.df$NEC.group), ]),
+             low = '#C0FFFF', high = '#000099', na.value = 'white', 
+             title = 'All, Tissue, Ileum') + theme(text = element_text(size = 10),
+                                                   axis.text.x = element_text(size = 10), 
+                                                   axis.text.y = element_text(size = 10))
+```
+
+## Additional file 3. Microbiota heatmap (colon tissue) - genus level
+
+```{r}
+sort.df <- get_variable(ps.t.co.rel.fil.genus, c('pigID', 'NEC.group'))
+plot_heatmap(ps.t.co.rel.fil.genus, 'PCoA', 'jaccard', sample.label = 'NEC.group',
+             taxa.label = 'Genus',
+             sample.order = row.names(sort.df[order(sort.df$NEC.group), ]),
+             low = '#C0FFFF', high = '#000099', na.value = 'white', 
+             title = 'All, Tissue, Colon') +  theme(text = element_text(size = 10),
+                                                    axis.text.x = element_text(size = 10), 
+                                                    axis.text.y = element_text(size = 10))
+
+```
+
+## Additional file 4. Microbiota heatmap (stomach contents) - genus level
+
+```{r}
+
+sort.df <- get_variable(ps.c.st.rel.fil.genus, c('pigID', 'NEC.group'))
+plot_heatmap(ps.c.st.rel.fil.genus, 'PCoA', 'jaccard', sample.label = 'NEC.group',
+             taxa.label = 'Genus',
+             sample.order = row.names(sort.df[order(sort.df$NEC.group), ]),
+             low = '#C0FFFF', high = '#000099', na.value = 'white', 
+             title = 'All, Contents, Stomach') +  theme(text = element_text(size = 10),
+                                                        axis.text.x = element_text(size = 10), 
+                                                        axis.text.y = element_text(size = 10))
+
+```
+
+## Additional file 5. Microbiota heatmap (ileum contents) - genus level
+
+```{r}
+sort.df <- get_variable(ps.c.il.rel.fil.genus, c('pigID', 'NEC.group'))
+plot_heatmap(ps.c.il.rel.fil.genus, 'PCoA', 'jaccard', sample.label = 'NEC.group',
+             taxa.label = 'Genus',
+             sample.order = row.names(sort.df[order(sort.df$NEC.group), ]),
+             low = '#C0FFFF', high = '#000099', na.value = 'white', 
+             title = 'All, Contents, Ileum') +  theme(text = element_text(size = 10),
+                                                      axis.text.x = element_text(size = 10), 
+                                                      axis.text.y = element_text(size = 10))
+
+```
+
+## Additional file 6. Microbiota heatmap (colon contents) - genus level
+
+```{r}
+sort.df <- get_variable(ps.c.co.rel.fil.genus, c('pigID', 'NEC.group'))
+plot_heatmap(ps.c.co.rel.fil.genus, 'PCoA', 'jaccard', sample.label = 'NEC.group',
+             taxa.label = 'Genus',
+             sample.order = row.names(sort.df[order(sort.df$NEC.group), ]),
+             low = '#C0FFFF', high = '#000099', na.value = 'white', 
+             title = 'All, Contents, Colon') +  theme(text = element_text(size = 10),
+                                                      axis.text.x = element_text(size = 10), 
+                                                      axis.text.y = element_text(size = 10))
+
+```
+
+## Additional file 7. Microbiota clustering by diet groups
+Created using CMMR analysis server (local) as follows:  the biom file and mapping file were uploaded, read counts were rarefied to ~2500 reads/sample, samples were split by GI site (stomach/ileum/colon) and sample type (tissue/contents), and principal coordinates analysis using unweighted UniFrac distance measures were performed. Significance of the clusters was assessed using a permutation test.
+
+## Additional file 8. Microbiota clustering by phenotype
+Created using CMMR analysis server (local) as follows:  the biom file and mapping file were uploaded, read counts were rarefied to ~2500 reads/sample, samples were split by GI site (stomach/ileum/colon) and sample type (tissue/contents), and principal coordinates analysis using unweighted UniFrac distance measures were performed. Significance of the clusters was assessed using a permutation test.
+
+## Additional file 9. Metabolite clustering diet and phenotype
+Created using Metaboanalyst.ca as follows:  a table containing the raw abundance values was uploaded, compound abundances were pre-processed, transformed and scaled exactly as done above for figures 10-13, and principle component analysis was performed.
+
+## Additional file 10. Metabolite heatmaps by diet groups
+Created using Metaboanalyst.ca as follows:  a table containing the raw abundance values was uploaded, compound abundances were pre-processed, transformed and scaled exactly as done above for figures 10-13, the top 50 most significant compounds by ANOVA were used for heirarchical clustering and displayed as a heatmap.
